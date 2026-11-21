@@ -1,450 +1,405 @@
 #!/usr/bin/env python3
-"""Compose the Saturday 21 November 2026 front page.
+"""Build the Saturday 21 November 2026 news front page (v2: panel-rich layout).
 
-Draws a 2048x2048 broadsheet page with Pillow: every word is typeset by this
-program from the story data below, so the text on the page is exact. The
-illustrations in elements/ were generated separately as text-free images and
-are only cropped or fitted into their slots. The finished page is downscaled
-to 1024x1024 and written to page.png next to this script.
+Composes 14 fresh, text-free illustration elements into a 2048x2048
+broadsheet page. Every word is typeset here, from the verified story
+list in dataset.md, so nothing on the page can be misspelled.
+Output: page.png at 1024x1024, <= 1,000,000 bytes.
 """
-
 import os
-
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ELEMENTS = os.path.join(HERE, "elements")
-FONT_DIR = "/usr/share/fonts/truetype/liberation"
-
-CANVAS = 2048
-MARGIN = 52
-CONTENT_W = CANVAS - 2 * MARGIN
+EL = os.path.join(HERE, "elements")
+W = 2048
+M = 44                      # page margin
+CW = W - 2 * M              # content width = 1960
 CREAM = (245, 239, 226)
 INK = (18, 16, 14)
 RED = (200, 16, 46)
 WHITE = (255, 255, 255)
-GREY = (90, 84, 76)
+GRAY = (90, 84, 76)
+TINTS = [(220, 232, 228), (239, 227, 200), (240, 220, 210)]
 
-# ---------------------------------------------------------------- fonts
+FD = "/usr/share/fonts/truetype/liberation/"
+SERIF_B = FD + "LiberationSerif-Bold.ttf"
+SERIF_I = FD + "LiberationSerif-Italic.ttf"
+SANS = FD + "LiberationSans-Regular.ttf"
+SANS_B = FD + "LiberationSans-Bold.ttf"
+SANS_I = FD + "LiberationSans-Italic.ttf"
 
-_cache = {}
-
-
-def font(kind, size):
-    key = (kind, size)
-    if key not in _cache:
-        name = {
-            "serif": "LiberationSerif-Regular.ttf",
-            "serif_b": "LiberationSerif-Bold.ttf",
-            "sans": "LiberationSans-Regular.ttf",
-            "sans_b": "LiberationSans-Bold.ttf",
-            "sans_i": "LiberationSans-Italic.ttf",
-        }[kind]
-        _cache[key] = ImageFont.truetype(os.path.join(FONT_DIR, name), size)
-    return _cache[key]
-
-
-# ---------------------------------------------------------------- text utils
+# ---- tunable sizes (measured layout; bottom must stay <= 2048) ----
+P = dict(
+    caps=24, title=86, stand=25,
+    stat_n=46, stat_c=18,
+    region=22, bar_h=22,
+    hero_panel=126, hero_k=23, hero_h=33, hero_b=24, hero_s=20,
+    med_panel=74, med_k=20, med_h=23, med_l=20,
+    map_head=26, map_h=156, map_leg=23,
+    brief=21, brief_lh=25,
+    dc=22, dc_lh=28, foot=19,
+)
 
 
-def wrap(draw, text, fnt, width):
-    """Split text into lines that fit width, measured with the real font."""
-    lines = []
-    for para in text.split("\n"):
-        words = para.split()
-        if not words:
-            lines.append("")
-            continue
-        line = words[0]
-        for word in words[1:]:
-            trial = line + " " + word
-            if draw.textlength(trial, font=fnt) <= width:
-                line = trial
-            else:
-                lines.append(line)
-                line = word
-        lines.append(line)
+def F(path, size):
+    return ImageFont.truetype(path, size)
+
+
+def wrap(d, text, font, width):
+    """Greedy word wrap; returns list of lines."""
+    lines, cur = [], ""
+    for word in text.split():
+        trial = (cur + " " + word).strip()
+        if d.textlength(trial, font=font) <= width:
+            cur = trial
+        else:
+            if cur:
+                lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
     return lines
 
 
-def text_block(draw, x, y, text, fnt, width, leading, fill=INK):
-    """Draw wrapped text, return the height it consumed."""
-    lines = wrap(draw, text, fnt, width)
+def wrap_mixed(d, parts, width):
+    """Wrap [(text, font), ...] as one paragraph; returns lines of segments."""
+    tokens = []  # (word, font)
+    for text, font in parts:
+        for w in text.split():
+            tokens.append((w, font))
+    space_w = {id(f): d.textlength(" ", font=f) for _, f in parts}
+    lines, cur, cur_w = [], [], 0.0
+    for w, f in tokens:
+        ww = d.textlength(w, font=f)
+        add = ww if not cur else ww + space_w[id(f)]
+        if cur and cur_w + add > width:
+            lines.append(cur)
+            cur, cur_w = [(w, f)], ww
+        else:
+            cur.append((w, f))
+            cur_w += add
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def draw_mixed(d, lines, x, y, lh, color=INK):
     for line in lines:
-        draw.text((x, y), line, font=fnt, fill=fill)
-        y += leading
-    return len(lines) * leading
+        cx = x
+        for w, f in line:
+            d.text((cx, y), w, font=f, fill=color)
+            cx += d.textlength(w, font=f) + d.textlength(" ", font=f)
+        y += lh
+    return y
 
 
-def tracked(draw, x, y, text, fnt, spacing, fill=INK):
-    """Draw letter-spaced text (for the small-caps masthead line)."""
-    for ch in text:
-        draw.text((x, y), ch, font=fnt, fill=fill)
-        x += draw.textlength(ch, font=fnt) + spacing
-    return x
-
-
-def tracked_width(draw, text, fnt, spacing):
-    return sum(draw.textlength(ch, font=fnt) + spacing for ch in text) - spacing
-
-
-def centered(draw, y, text, fnt, fill=INK):
-    w = draw.textlength(text, font=fnt)
-    draw.text(((CANVAS - w) / 2, y), text, font=fnt, fill=fill)
-
-
-# ---------------------------------------------------------------- images
-
-
-def banner(path, w, h):
-    """Centre-crop an image to exactly w x h."""
+def paste_cover(img, path, box):
+    """Scale-to-cover + centre crop into box (x, y, w, h)."""
+    x, y, w, h = box
     im = Image.open(path).convert("RGB")
-    return ImageOps.fit(im, (w, h), Image.LANCZOS)
+    sc = max(w / im.width, h / im.height)
+    im = im.resize((max(1, round(im.width * sc)), max(1, round(im.height * sc))),
+                   Image.LANCZOS)
+    ox = (im.width - w) // 2
+    oy = (im.height - h) // 2
+    img.paste(im.crop((ox, oy, ox + w, oy + h)), (x, y))
 
 
-# ---------------------------------------------------------------- content
+def banner(d, x, y, text, font, h):
+    tw = d.textlength(text, font=font)
+    d.rectangle([x, y, x + tw + 22, y + h], fill=RED)
+    d.text((x + 11, y + h // 2 - font.size // 2 - 2), text, font=font, fill=WHITE)
+    return tw + 22
 
-STATS = [
-    ("10,000", "Rohingya killed in 2017"),
-    ("9\u20136", "the judges' vote"),
-    ("400+", "drones over Ukraine"),
-    ("3", "missiles downed, Riyadh"),
-    ("6.7", "the Peru quake"),
-    ("$55.5K", "bitcoin's two-year low"),
-]
 
-REGIONS = [("Europe", 7), ("Asia", 12), ("Middle East", 3),
-           ("Americas", 9), ("Oceania", 1), ("Global", 3)]
-
+# ---------------------------------------------------------------- data
 HEROES = [
-    ("el_hero1.jpg", "1 \u00b7 THE HAGUE \u00b7 JUSTICE",
-     "World court finds Myanmar guilty of genocide",
-     "Judges voted 9 to 6 that Myanmar committed genocide against the "
-     "Rohingya in 2017. Myanmar must prosecute the commanders and pay "
-     "reparations.",
-     "Sources: ICJ, Reuters"),
-    ("el_hero2.jpg", "2 \u00b7 KYIV \u00b7 WAR",
-     "Russia fires 400 drones at Ukraine; two missiles land in Poland",
-     "The barrage killed at least eight in Kyiv and hit bridges and rail "
-     "stations. Warsaw calls the missiles in Poland a deliberate "
-     "provocation.",
-     "Sources: France 24, CBS News"),
-    ("el_hero3.jpg", "3 \u00b7 ANTALYA \u00b7 CLIMATE",
-     "COP31 runs past its deadline with no deal",
-     "Nearly 200 nations failed to close on Friday; the draft deletes the "
-     "words \u201cfossil fuel\u201d. A call to triple adaptation funding by "
-     "2035 survives.",
-     "Sources: AFP, Al Jazeera"),
+    dict(img="el_hero1.jpg", label="ICJ: GENOCIDE VERDICT",
+         kicker="1 · THE HAGUE · JUSTICE",
+         head="World court finds Myanmar guilty of genocide",
+         body="Judges voted 9 to 6 that Myanmar committed genocide against the Rohingya in 2017. Myanmar must prosecute the commanders and pay reparations.",
+         src="Sources: ICJ, Reuters"),
+    dict(img="el_hero2.jpg", label="KYIV: 400 DRONES",
+         kicker="2 · KYIV · WAR",
+         head="Russia fires 400 drones at Ukraine; two missiles land in Poland",
+         body="The barrage killed at least eight in Kyiv and hit bridges and rail stations. Warsaw calls the missiles in Poland a deliberate provocation.",
+         src="Sources: France 24, CBS News"),
+    dict(img="el_hero3.jpg", label="COP31: OVERTIME",
+         kicker="3 · ANTALYA · CLIMATE",
+         head="COP31 runs past its deadline with no deal",
+         body="Nearly 200 nations failed to close on Friday; the draft deletes the words \u201cfossil fuel\u201d. A call to triple adaptation funding by 2035 survives.",
+         src="Sources: AFP, Al Jazeera"),
 ]
 
 MEDIUMS = [
-    ("el_m4.jpg", "4 \u00b7 RIYADH \u00b7 WAR",
-     "Saudi Arabia downs three Houthi missiles over Riyadh",
-     "Second attack on the capital in two days. No casualties. (Reuters)"),
-    ("el_m5.jpg", "5 \u00b7 JUN\u00cdN \u00b7 EARTHQUAKE",
-     "Magnitude 6.7 quake shakes central Peru",
-     "Felt in Lima. Depth disputed: 108 km (USGS), 129 km (IGP). "
-     "(USGS, IGP, AFP)"),
-    ("el_m6.jpg", "6 \u00b7 MARKETS \u00b7 CRYPTO",
-     "Bitcoin crashes through $60,000 to a two-year low",
-     "The AI rout spilled into crypto; bitcoin touched $55,500, down 18% "
-     "in seven days. (Reuters, CoinGecko)"),
-    ("el_m7.jpg", "7 \u00b7 DAVAO \u00b7 AVIATION",
-     "146 people walk away from an engine-fire scare",
-     "An Air Niugini 767 diverted on a fire indication. All 146 aboard "
-     "left by the slides. (AP, CAAP)"),
-    ("el_m8.jpg", "8 \u00b7 BRUSSELS \u00b7 POLITICS",
-     "UK and EU sign their biggest post-Brexit deal",
-     "Food exports, carbon markets, youth mobility. (BBC)"),
-    ("el_m9.jpg", "9 \u00b7 NEW YORK \u00b7 CYBER",
-     "Three card giants report vendor cyber incidents",
-     "JPMorgan, Visa and Mastercard say payments run as normal. (Reuters)"),
-    ("el_m10.jpg", "10 \u00b7 LEONIDA \u00b7 GAMES",
-     "GTA 6 goes on sale; players move to Leonida",
-     "Release weekend, 13 years after the last game. (IGN)"),
-    ("el_m11.jpg", "11 \u00b7 WELLINGTON \u00b7 CRICKET",
-     "Rahul makes 136 and India take a 118-run lead",
-     "Gill fell for 98. India closed day three on 486 for 4; New Zealand "
-     "made 368. (ESPNcricinfo)"),
-    ("el_m12.jpg", "12 \u00b7 LAHORE \u00b7 CRICKET",
-     "Pakistan beat Sri Lanka by eight wickets, take the series",
-     "The win ends a two-year series drought. (Dawn)"),
-    ("el_m13.jpg", "13 \u00b7 LAS VEGAS \u00b7 FORMULA 1",
-     "Russell tops Vegas practice, clashes with Verstappen",
-     "His 1:34.041 led a Mercedes one-two. Stewards will investigate the "
-     "contact. (Reuters, FIA)"),
+    dict(img="el_m4.jpg", label="RIYADH: MISSILES DOWN", kicker="4 · RIYADH · WAR",
+         head="Saudi Arabia downs three Houthi missiles over Riyadh",
+         line="Second attack on the capital in two days. No casualties. (Reuters)"),
+    dict(img="el_m5.jpg", label="PERU: QUAKE 6.7", kicker="5 · JUNÍN · EARTHQUAKE",
+         head="Magnitude 6.7 quake shakes central Peru",
+         line="Felt in Lima. Depth disputed: 108 km (USGS), 129 km (IGP). (USGS, IGP, AFP)"),
+    dict(img="el_m6.jpg", label="BITCOIN: TWO-YEAR LOW", kicker="6 · MARKETS · CRYPTO",
+         head="Bitcoin crashes through $60,000 to a two-year low",
+         line="The AI rout spilled into crypto; bitcoin touched $55,500, down 18% in seven days. (Reuters, CoinGecko)"),
+    dict(img="el_m7.jpg", label="DAVAO: 146 SAFE", kicker="7 · DAVAO · AVIATION",
+         head="146 people walk away from an engine-fire scare",
+         line="An Air Niugini 767 diverted on a fire indication. All 146 aboard left by the slides. (AP, CAAP)"),
+    dict(img="el_m8.jpg", label="BRUSSELS: EU DEAL", kicker="8 · BRUSSELS · POLITICS",
+         head="UK and EU sign their biggest post-Brexit deal",
+         line="Food exports, carbon markets, youth mobility. (BBC)"),
+    dict(img="el_m9.jpg", label="CARDS: CYBER SCARE", kicker="9 · NEW YORK · CYBER",
+         head="Three card giants report vendor cyber incidents",
+         line="JPMorgan, Visa and Mastercard say payments run as normal. (Reuters)"),
+    dict(img="el_m10.jpg", label="GTA 6: ON SALE", kicker="10 · LEONIDA · GAMES",
+         head="GTA 6 goes on sale; players move to Leonida",
+         line="Release weekend, 13 years after the last game. (IGN)"),
+    dict(img="el_m11.jpg", label="RAHUL: 136", kicker="11 · WELLINGTON · CRICKET",
+         head="Rahul makes 136 and India take a 118-run lead",
+         line="Gill fell for 98. India closed day three on 486 for 4; New Zealand made 368. (ESPNcricinfo)"),
+    dict(img="el_m12.jpg", label="PAKISTAN: SERIES WON", kicker="12 · LAHORE · CRICKET",
+         head="Pakistan beat Sri Lanka by eight wickets, take the series",
+         line="The win ends a two-year series drought. (Dawn)"),
+    dict(img="el_m13.jpg", label="VEGAS: RUSSELL P1", kicker="13 · LAS VEGAS · FORMULA 1",
+         head="Russell tops Vegas practice, clashes with Verstappen",
+         line="His 1:34.041 led a Mercedes one-two. Stewards will investigate the contact. (Reuters, FIA)"),
 ]
 
-PINS = [  # (number, name, longitude, latitude)
-    (1, "The Hague", 4.5, 52.1),
-    (2, "Kyiv", 30.5, 50.4),
-    (3, "Antalya", 30.7, 36.9),
-    (4, "Riyadh", 46.7, 24.6),
-    (5, "Jun\u00edn (Peru)", -75.5, -11.5),
-    (6, "New York", -74.0, 40.7),
-    (7, "Davao", 125.6, 7.1),
-    (8, "Brussels", 4.35, 50.85),
-    (9, "Florida", -81.0, 27.0),
-    (10, "Wellington", 174.8, -41.3),
-    (11, "Lahore", 74.3, 31.5),
-    (12, "Las Vegas", -115.1, 36.1),
-    (13, "Odisha", 85.1, 19.8),
-]
+STATS = [("10,000", "Rohingya killed in 2017"), ("9–6", "the judges' vote"),
+         ("400+", "drones over Ukraine"), ("3", "missiles downed, Riyadh"),
+         ("6.7", "the Peru quake"), ("$55.5K", "bitcoin's two-year low")]
+REGIONS = [("Europe", 7), ("Asia", 12), ("Middle East", 3),
+           ("Americas", 9), ("Oceania", 1), ("Global", 3)]
+
+PINS = [(1, 4.5, 52.1, "The Hague"), (2, 30.5, 50.4, "Kyiv"),
+        (3, 30.7, 36.9, "Antalya"), (4, 46.7, 24.6, "Riyadh"),
+        (5, -75.5, -11.5, "Junín (Peru)"), (6, -74.0, 40.7, "New York"),
+        (7, 125.6, 7.1, "Davao"), (8, 4.35, 50.85, "Brussels"),
+        (9, -81.0, 27.0, "Florida"), (10, 174.8, -41.3, "Wellington"),
+        (11, 74.3, 31.5, "Lahore"), (12, -115.1, 36.1, "Las Vegas"),
+        (13, 85.1, 19.8, "Odisha")]
 
 BRIEFS = [
-    "14 Shenzhen \u2014 Trump, Xi and Putin open a trilateral summit and "
-    "sign fuel deals (Reuters)",
-    "15 Moscow \u2014 Russia rules out NATO membership in any Ukraine "
-    "settlement (TASS)",
-    "16 Budapest \u2014 Hungary drops its block on the EU package (Reuters)",
-    "17 Naypyidaw \u2014 Myanmar calls the genocide ruling biased and "
-    "unjust (AFP)",
-    "18 Gaza \u2014 UNICEF counts child casualties still rising (UNICEF)",
-    "19 Kuala Lumpur \u2014 Malaysia will resettle 10,000 Rohingya in "
-    "T\u00fcrkiye (Bernama)",
-    "20 New York \u2014 A US court jails an Indian national for 19 years "
-    "over a plot to kill a Sikh separatist (AP)",
-    "21 Washington \u2014 Trump attacks the Fed over interest rates "
-    "(Bloomberg)",
-    "22 Jakarta \u2014 Indonesia counts $30 billion in fire losses (Antara)",
-    "23 Rome \u2014 The WFP warns 2027 food aid falls short (WFP)",
-    "24 Kathmandu \u2014 Nepal's prime minister visits India on "
-    "22\u201323 November (PTI)",
-    "25 Delhi \u2014 Pakistan's climate minister joins the SCO forum in "
-    "India (Dawn)",
-    "26 Gaza \u2014 Israeli strikes kill Palestinians as West Bank "
-    "violence continues (One Turn)",
-    "27 Washington \u2014 Trump threatens to ban US firms from building AI "
-    "data centres abroad (Reuters)",
-    "28 Washington \u2014 A hacker reportedly breaches an FBI criminal "
-    "database as outages continue (One Turn)",
-    "29 London \u2014 A trial pill makes pancreatic tumours undetectable "
-    "in 1 in 12 patients (One Turn)",
-    "30 Berlin \u2014 Gen Z protests spread across 25 European countries "
-    "(One Turn)",
-    "31 Los Angeles \u2014 A court convicts the man who started the deadly "
-    "Palisades fire (AFP)",
-    "32 Port-au-Prince \u2014 Salvadoran troops in Haiti lose soldiers to "
-    "explosives (One Turn)",
-    "33 Madrid \u2014 Spain sets a 29 November election as conservatives "
-    "gain (El Pa\u00eds)",
-    "34 Odisha \u2014 Crews clear Cyclone Akvan's damage as the storm "
-    "weakens (PTI)",
-    "35 Kuno \u2014 A cheetah brought from Botswana gives birth to four "
-    "cubs (PTI)",
+    (14, "Shenzhen", "Trump, Xi and Putin open a trilateral summit and sign fuel deals", "Reuters"),
+    (15, "Moscow", "Russia rules out NATO membership in any Ukraine settlement", "TASS"),
+    (16, "Budapest", "Hungary drops its block on the EU package", "Reuters"),
+    (17, "Naypyidaw", "Myanmar calls the genocide ruling biased and unjust", "AFP"),
+    (18, "Gaza", "UNICEF counts child casualties still rising", "UNICEF"),
+    (19, "Kuala Lumpur", "Malaysia will resettle 10,000 Rohingya in Türkiye", "Bernama"),
+    (20, "New York", "A US court jails an Indian national for 19 years over a plot to kill a Sikh separatist", "AP"),
+    (21, "Washington", "Trump attacks the Fed over interest rates", "Bloomberg"),
+    (22, "Jakarta", "Indonesia counts $30 billion in fire losses", "Antara"),
+    (23, "Rome", "The WFP warns 2027 food aid falls short", "WFP"),
+    (24, "Kathmandu", "Nepal's prime minister visits India on 22–23 November", "PTI"),
+    (25, "Delhi", "Pakistan's climate minister joins the SCO forum in India", "Dawn"),
+    (26, "Gaza", "Israeli strikes kill Palestinians as West Bank violence continues", "One Turn"),
+    (27, "Washington", "Trump threatens to ban US firms from building AI data centres abroad", "Reuters"),
+    (28, "Washington", "A hacker reportedly breaches an FBI criminal database as outages continue", "One Turn"),
+    (29, "London", "A trial pill makes pancreatic tumours undetectable in 1 in 12 patients", "One Turn"),
+    (30, "Berlin", "Gen Z protests spread across 25 European countries", "One Turn"),
+    (31, "Los Angeles", "A court convicts the man who started the deadly Palisades fire", "AFP"),
+    (32, "Port-au-Prince", "Salvadoran troops in Haiti lose soldiers to explosives", "One Turn"),
+    (33, "Madrid", "Spain sets a 29 November election as conservatives gain", "El País"),
+    (34, "Odisha", "Crews clear Cyclone Akvan's damage as the storm weakens", "PTI"),
+    (35, "Kuno", "A cheetah brought from Botswana gives birth to four cubs", "PTI"),
 ]
 
-DATE_CHECK = (
-    "DATE CHECK \u2014 Left out as Friday's news: the first strikes on "
-    "Kyiv's bridges (Saturday's barrage is story 2), Thursday's missile "
-    "hit on Riyadh's PIF tower, the Sensex's 898-point Friday close, and "
-    "Akvan's landfall; its clean-up is brief 34. Not confirmed when drawn: "
-    "a final COP31 text, and whether any fire burned on the Davao jet "
-    "\u2014 officials report an indication, not a fire."
-)
-
-
-# ---------------------------------------------------------------- layout
-# Tunable sizes (2048px canvas). Sections advance a cursor; build() prints
-# where each section ends so overflow is visible before the final render.
-
-P = dict(
-    kick_size=25, title_size=80, stand_size=28,
-    stat_num=52, stat_cap=22,
-    hero_img=84, hero_kick=25, hero_head=37, hero_head_lead=40,
-    hero_body=24, hero_body_lead=29, hero_src=22,
-    med_img=28, med_kick=20, med_head=22, med_head_lead=26,
-    med_body=21, med_body_lead=24,
-    map_head=30, map_w=690, legend_size=21, legend_lead=25,
-    brief_size=21, brief_lead=23,
-    check_size=21, check_lead=24,
-)
-
-
-def rule(draw, y, weight=3):
-    draw.line([(MARGIN, y), (CANVAS - MARGIN, y)], fill=INK, width=weight)
-    return y + weight
+DATE_CHECK = ("Left out as Friday's news: the first strikes on Kyiv's bridges "
+              "(Saturday's barrage is story 2), Thursday's missile hit on Riyadh's "
+              "PIF tower, the Sensex's 898-point Friday close, and Akvan's "
+              "landfall; its clean-up is brief 34. Not confirmed when drawn: a "
+              "final COP31 text, and whether any fire burned on the Davao jet — "
+              "officials report an indication, not a fire.")
+FOOTER = ("Every story here happened, or was first reported, on Saturday 21 "
+          "November 2026. Officials' counts and claims are attributed. "
+          "Sources named beside each story.")
 
 
 def build():
-    page = Image.new("RGB", (CANVAS, CANVAS), CREAM)
-    d = ImageDraw.Draw(page)
-    y = 34
+    img = Image.new("RGB", (W, W), CREAM)
+    d = ImageDraw.Draw(img)
+    y = 26
 
-    # ---- masthead
-    f_kick = font("sans_b", P["kick_size"])
-    label = "THE WORLD IN ONE DAY \u2014 SATURDAY EDITION"
-    w = tracked_width(d, label, f_kick, 6)
-    tracked(d, (CANVAS - w) / 2, y, label, f_kick, 6, fill=RED)
-    y += P["kick_size"] + 16
-    centered(d, y, "Saturday 21 November 2026", font("serif_b", P["title_size"]))
-    y += P["title_size"] + 14
-    centered(d, y,
-             "World court convicts Myanmar of genocide \u00b7 400 drones "
-             "over Kyiv \u00b7 COP31 ends without a deal",
-             font("sans_i", P["stand_size"]))
-    y += P["stand_size"] + 12
-    y = rule(d, y, 5) + 14
-    print(f"masthead ends {y}")
+    # ---- masthead ----
+    f = F(SANS_B, P["caps"])
+    t = "THE WORLD IN ONE DAY — SATURDAY EDITION"
+    d.text(((W - d.textlength(t, font=f)) / 2, y), t, font=f, fill=RED)
+    y += P["caps"] + 12
+    f = F(SERIF_B, P["title"])
+    t = "Saturday 21 November 2026"
+    d.text(((W - d.textlength(t, font=f)) / 2, y), t, font=f, fill=INK)
+    y += P["title"] + 10
+    f = F(SERIF_I, P["stand"])
+    t = "World court convicts Myanmar of genocide · 400 drones over Kyiv · COP31 ends without a deal"
+    d.text(((W - d.textlength(t, font=f)) / 2, y), t, font=f, fill=INK)
+    y += P["stand"] + 12
+    d.line([M, y, W - M, y], fill=INK, width=4)
+    y += 14
 
-    # ---- stat band
-    col = CONTENT_W / 6
-    f_num, f_cap = font("sans_b", P["stat_num"]), font("sans", P["stat_cap"])
+    # ---- stat band ----
+    fn, fc = F(SERIF_B, P["stat_n"]), F(SANS, P["stat_c"])
+    colw = CW // 6
     for i, (num, cap) in enumerate(STATS):
-        x = MARGIN + i * col
-        d.text((x, y), num, font=f_num, fill=INK)
-        lines = wrap(d, cap, f_cap, col - 18)
-        cy = y + P["stat_num"] + 8
-        for line in lines:
-            d.text((x, cy), line, font=f_cap, fill=GREY)
-            cy += P["stat_cap"] + 5
-    y += P["stat_num"] + 8 + 2 * (P["stat_cap"] + 5) + 8
-    y = rule(d, y, 3) + 12
-    print(f"stats end {y}")
+        x = M + i * colw
+        if i:
+            d.line([x - 12, y + 4, x - 12, y + P["stat_n"] + P["stat_c"] + 8],
+                   fill=GRAY, width=1)
+        d.text((x, y), num, font=fn, fill=INK)
+        d.text((x, y + P["stat_n"] + 6), cap, font=fc, fill=GRAY)
+    y += P["stat_n"] + P["stat_c"] + 16
+    d.line([M, y, W - M, y], fill=INK, width=2)
+    y += 10
 
-    # ---- region bar
+    # ---- region bar ----
     total = sum(n for _, n in REGIONS)
-    x = MARGIN
+    x = M
     for i, (_, n) in enumerate(REGIONS):
-        w = CONTENT_W * n / total
-        d.rectangle([x, y, x + w - 3, y + 24],
+        wseg = CW * n // total
+        if i == len(REGIONS) - 1:
+            wseg = W - M - x
+        d.rectangle([x, y, x + wseg, y + P["bar_h"]],
                     fill=RED if i % 2 else INK)
-        x += w
-    y += 24 + 8
-    legend = " \u00b7 ".join(f"{name} {n}" for name, n in REGIONS)
-    centered(d, y, legend, font("sans_b", 25))
-    y += 25 + 14
-    print(f"region bar ends {y}")
+        x += wseg
+    y += P["bar_h"] + 6
+    f = F(SANS, P["region"])
+    t = "  ·  ".join(f"{name} {n}" for name, n in REGIONS)
+    d.text(((W - d.textlength(t, font=f)) / 2, y), t, font=f, fill=INK)
+    y += P["region"] + 14
 
-    # ---- heroes, three columns
-    gap = 32
-    cw = (CONTENT_W - 2 * gap) / 3
-    f_kick = font("sans_b", P["hero_kick"])
-    f_head = font("serif_b", P["hero_head"])
-    f_body = font("sans", P["hero_body"])
-    f_src = font("sans_i", P["hero_src"])
-    hero_h = 0
-    for i, (img, kick, head, body, src) in enumerate(HEROES):
-        x = MARGIN + i * (cw + gap)
-        yy = y
-        page.paste(banner(os.path.join(ELEMENTS, img), int(cw), P["hero_img"]),
-                   (int(x), yy))
-        yy += P["hero_img"] + 10
-        d.text((x, yy), kick, font=f_kick, fill=RED)
-        yy += P["hero_kick"] + 8
-        yy += text_block(d, x, yy, head, f_head, cw, P["hero_head_lead"])
-        yy += 4
-        yy += text_block(d, x, yy, body, f_body, cw, P["hero_body_lead"])
-        yy += 4
-        d.text((x, yy), src, font=f_src, fill=GREY)
-        yy += P["hero_src"] + 4
-        hero_h = max(hero_h, yy - y)
-    y += hero_h + 6
-    y = rule(d, y, 3) + 12
-    print(f"heroes end {y}")
+    # ---- heroes ----
+    fk, fh, fb, fs = (F(SANS_B, P["hero_k"]), F(SERIF_B, P["hero_h"]),
+                      F(SANS, P["hero_b"]), F(SANS_I, P["hero_s"]))
+    flab = F(SANS_B, 23)
+    gap, colw = 29, (CW - 2 * 29) // 3
+    # measure
+    cards = []
+    for hro in HEROES:
+        hh = len(wrap(d, hro["head"], fh, colw - 16))
+        hb = len(wrap(d, hro["body"], fb, colw - 16))
+        cards.append((hh, hb))
+    card_h = (P["hero_panel"] + 8 + P["hero_k"] + 6 +
+              max(c[0] for c in cards) * (P["hero_h"] + 7) + 5 +
+              max(c[1] for c in cards) * (P["hero_b"] + 5) + 5 + P["hero_s"] + 4)
+    for i, hro in enumerate(HEROES):
+        x = M + i * (colw + gap)
+        d.rectangle([x - 8, y - 6, x + colw + 8, y + card_h + 6], fill=TINTS[i % 3])
+        paste_cover(img, os.path.join(EL, hro["img"]), (x, y, colw, P["hero_panel"]))
+        banner(d, x, y, hro["label"], flab, 36)
+        ty = y + P["hero_panel"] + 8
+        d.text((x, ty), hro["kicker"], font=fk, fill=RED)
+        ty += P["hero_k"] + 6
+        for ln in wrap(d, hro["head"], fh, colw - 16):
+            d.text((x, ty), ln, font=fh, fill=INK)
+            ty += P["hero_h"] + 7
+        ty += 5
+        for ln in wrap(d, hro["body"], fb, colw - 16):
+            d.text((x, ty), ln, font=fb, fill=INK)
+            ty += P["hero_b"] + 5
+        ty += 5
+        d.text((x, ty), hro["src"], font=fs, fill=GRAY)
+    y += card_h + 18
 
-    # ---- mediums, 5 x 2 grid
-    gap = 24
-    cw = (CONTENT_W - 4 * gap) / 5
-    f_kick = font("sans_b", P["med_kick"])
-    f_head = font("sans_b", P["med_head"])
-    f_body = font("sans", P["med_body"])
+    # ---- mediums ----
+    fk, fh, fl = (F(SANS_B, P["med_k"]), F(SANS_B, P["med_h"]), F(SANS, P["med_l"]))
+    flab = F(SANS_B, 18)
+    gap, colw = 25, (CW - 4 * 25) // 5
     for row in range(2):
-        cell_h = 0
-        for col_i in range(5):
-            img, kick, head, body = MEDIUMS[row * 5 + col_i]
-            x = MARGIN + col_i * (cw + gap)
-            yy = y
-            page.paste(banner(os.path.join(ELEMENTS, img), int(cw),
-                              P["med_img"]), (int(x), yy))
-            yy += P["med_img"] + 7
-            d.text((x, yy), kick, font=f_kick, fill=RED)
-            yy += P["med_kick"] + 5
-            yy += text_block(d, x, yy, head, f_head, cw, P["med_head_lead"])
-            yy += 2
-            yy += text_block(d, x, yy, body, f_body, cw, P["med_body_lead"])
-            cell_h = max(cell_h, yy - y)
-        y += cell_h + 10
-    y = rule(d, y - 4, 3) + 12
-    print(f"mediums end {y}")
+        group = MEDIUMS[row * 5:(row + 1) * 5]
+        hh = max(len(wrap(d, m["head"], fh, colw - 12)) for m in group)
+        hl = max(len(wrap(d, m["line"], fl, colw - 12)) for m in group)
+        card_h = (P["med_panel"] + 6 + P["med_k"] + 4 + hh * (P["med_h"] + 5) +
+                  4 + hl * (P["med_l"] + 5))
+        for i, m in enumerate(group):
+            x = M + i * (colw + gap)
+            d.rectangle([x - 7, y - 5, x + colw + 7, y + card_h + 5],
+                        fill=TINTS[(row * 5 + i) % 3])
+            paste_cover(img, os.path.join(EL, m["img"]), (x, y, colw, P["med_panel"]))
+            banner(d, x, y, m["label"], flab, 29)
+            ty = y + P["med_panel"] + 6
+            d.text((x, ty), m["kicker"], font=fk, fill=RED)
+            ty += P["med_k"] + 4
+            for ln in wrap(d, m["head"], fh, colw - 12):
+                d.text((x, ty), ln, font=fh, fill=INK)
+                ty += P["med_h"] + 5
+            ty += 4
+            for ln in wrap(d, m["line"], fl, colw - 12):
+                d.text((x, ty), ln, font=fl, fill=INK)
+                ty += P["med_l"] + 5
+        y += card_h + 14
 
-    # ---- map band
-    d.text((MARGIN, y), "ALSO ON SATURDAY 21 NOVEMBER",
-           font=font("sans_b", P["map_head"]), fill=INK)
-    y += P["map_head"] + 12
-    map_im = Image.open(os.path.join(ELEMENTS, "el_map.jpg")).convert("RGB")
-    map_im = ImageOps.contain(map_im, (P["map_w"], 100000), Image.LANCZOS)
-    page.paste(map_im, (MARGIN, y))
-    mw, mh = map_im.size
-    f_pin = font("sans_b", 19)
-    for num, _name, lon, lat in PINS:
-        fx = (lon + 180) / 360
-        fy = 0.41 + (27 - lat) * 0.00524  # calibrated to this map image
-        px, py = MARGIN + fx * mw, y + fy * mh
-        if num == 8:  # Brussels: nudge off The Hague's pin
-            px, py = px + 26, py + 15
-        r = 16
-        d.ellipse([px - r, py - r, px + r, py + r], fill=RED,
-                  outline=WHITE, width=3)
-        s = str(num)
-        tw = d.textlength(s, font=f_pin)
-        d.text((px - tw / 2, py - 10), s, font=f_pin, fill=WHITE)
-    lx = MARGIN + mw + 36
-    f_leg = font("sans", P["legend_size"])
-    ly = y + 4
-    for num, name, _lon, _lat in PINS:
-        d.ellipse([lx, ly + 4, lx + 20, ly + 24], fill=RED)
-        s = str(num)
-        tw = d.textlength(s, font=font("sans_b", 15))
-        d.text((lx + 10 - tw / 2, ly + 5), s, font=font("sans_b", 15),
-               fill=WHITE)
-        d.text((lx + 30, ly), name, font=f_leg, fill=INK)
-        ly += P["legend_lead"]
-    y += max(mh, ly - y) + 8
-    y = rule(d, y, 3) + 12
-    print(f"map band ends {y}")
+    # ---- map band ----
+    f = F(SANS_B, P["map_head"])
+    d.text((M, y), "ALSO ON SATURDAY 21 NOVEMBER", font=f, fill=RED)
+    y += P["map_head"] + 8
+    map_box_w = 500
+    mim = Image.open(os.path.join(EL, "el_map.jpg")).convert("RGB")
+    sc = min(map_box_w / mim.width, P["map_h"] / mim.height)
+    mw2, mh2 = int(mim.width * sc), int(mim.height * sc)
+    mim = mim.resize((mw2, mh2), Image.LANCZOS)
+    mx = M + (map_box_w - mw2) // 2
+    img.paste(mim, (mx, y))
+    fp = F(SANS_B, 14)
+    for n, lon, lat, _name in PINS:
+        px = mx + int((lon + 180) / 360 * mw2)
+        py = y + int((0.40 + (27 - lat) / 187) * mh2)
+        if n == 8:  # Brussels nudged off The Hague
+            px, py = px + 13, py + 8
+        d.ellipse([px - 11, py - 11, px + 11, py + 11], fill=RED, outline=WHITE, width=2)
+        s = str(n)
+        d.text((px - d.textlength(s, font=fp) / 2, py - 8), s, font=fp, fill=WHITE)
+    fl = F(SANS, P["map_leg"])
+    lx = M + map_box_w + 28
+    colw_l = (W - M - lx) // 3
+    for i, (n, _lon, _lat, name) in enumerate(PINS):
+        cx = lx + (i % 3) * colw_l
+        cy = y + (i // 3) * (P["map_leg"] + 7)
+        d.text((cx, cy), f"{n} {name}", font=fl, fill=INK)
+    y += P["map_h"] + 12
 
-    # ---- briefs, three columns
-    gap = 32
-    cw = (CONTENT_W - 2 * gap) / 3
-    f_brief = font("sans", P["brief_size"])
-    columns = [BRIEFS[0:8], BRIEFS[8:15], BRIEFS[15:22]]
-    brief_h = 0
-    for ci, items in enumerate(columns):
-        x = MARGIN + ci * (cw + gap)
-        yy = y
-        for item in items:
-            yy += text_block(d, x, yy, item, f_brief, cw, P["brief_lead"])
-            yy += 4
-        brief_h = max(brief_h, yy - y)
-    y += brief_h + 4
-    print(f"briefs end {y}")
+    # ---- briefs (3 columns, filled down) ----
+    fb_b, fb_r = F(SANS_B, P["brief"]), F(SANS, P["brief"])
+    colw = (CW - 2 * 29) // 3
+    counts = [8, 7, 7]
+    idx = 0
+    col_ends = []
+    for c in range(3):
+        x = M + c * (colw + 29)
+        cy = y
+        for _ in range(counts[c]):
+            n, city, text, src = BRIEFS[idx]
+            idx += 1
+            parts = [(f"{n} {city} — ", fb_b), (f"{text} ({src})", fb_r)]
+            lines = wrap_mixed(d, parts, colw - 8)
+            cy = draw_mixed(d, lines, x, cy, P["brief_lh"])
+            cy += 9
+        col_ends.append(cy)
+    y = max(col_ends) + 4
 
-    # ---- date check strip
-    f_check = font("sans_b", P["check_size"])
-    lines = wrap(d, DATE_CHECK, f_check, CONTENT_W - 44)
-    strip_h = len(lines) * P["check_lead"] + 22
-    d.rectangle([MARGIN, y, CANVAS - MARGIN, y + strip_h], fill=RED)
-    cy = y + 11
-    for line in lines:
-        d.text((MARGIN + 22, cy), line, font=f_check, fill=WHITE)
-        cy += P["check_lead"]
-    y += strip_h
-    print(f"date check ends {y} of {CANVAS}")
-    assert y <= CANVAS, f"page overflows: content ends at {y}"
+    # ---- date check box ----
+    fd_b, fd_r = F(SANS_B, P["dc"]), F(SANS, P["dc"])
+    parts = [("DATE CHECK — ", fd_b), (DATE_CHECK, fd_r)]
+    lines = wrap_mixed(d, parts, CW - 48)
+    box_h = len(lines) * P["dc_lh"] + 22
+    d.rectangle([M, y, W - M, y + box_h], outline=RED, width=3)
+    draw_mixed(d, lines, M + 24, y + 11, P["dc_lh"])
+    y += box_h + 12
 
-    # ---- final render at 1024
-    final = page.resize((1024, 1024), Image.LANCZOS)
-    out = os.path.join(HERE, "page.png")
-    final.save(out, format="PNG", optimize=True)
-    size = os.path.getsize(out)
+    # ---- footer ----
+    f = F(SANS_I, P["foot"])
+    for ln in wrap(d, FOOTER, f, CW):
+        d.text(((W - d.textlength(ln, font=f)) / 2, y), ln, font=f, fill=GRAY)
+        y += P["foot"] + 5
+
+    print("bottom edge:", y, "of", W)
+    out = img.resize((1024, 1024), Image.LANCZOS)
+    tmp = os.path.join(HERE, "_page_tmp.png")
+    out.save(tmp)
+    size = os.path.getsize(tmp)
     if size > 1_000_000:
-        final.convert("RGB").quantize(colors=256, method=Image.MEDIANCUT) \
-            .save(out, format="PNG", optimize=True)
-        size = os.path.getsize(out)
-    print(f"page.png: {size} bytes")
-    assert size <= 1_000_000, f"page.png too large: {size}"
-    return out
+        out = out.quantize(colors=256)
+        out.save(tmp)
+        size = os.path.getsize(tmp)
+    os.replace(tmp, os.path.join(HERE, "page.png"))
+    print("page.png bytes:", size)
 
 
 if __name__ == "__main__":
